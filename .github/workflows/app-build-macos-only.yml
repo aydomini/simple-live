@@ -1,0 +1,273 @@
+name: app-build-macos-only
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "要发布的分支、tag 或 commit"
+        required: true
+        default: "master"
+      version:
+        description: "Release tag，例如 v1.11.4；留空则读取 simple_live_app/pubspec.yaml"
+        required: false
+        default: ""
+      prerelease:
+        description: "是否标记为预发布"
+        type: boolean
+        required: true
+        default: false
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    name: Build macOS DMG and Release
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+
+    env:
+      APP_DIR: simple_live_app
+      FLUTTER_VERSION: "3.38.x"
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            SHOULD_CREATE_TAG="false"
+          else
+            if [ -n "$INPUT_VERSION" ]; then
+              RAW_VERSION="$INPUT_VERSION"
+            else
+              PUBSPEC_VERSION="$(sed -nE "s/^version:[[:space:]]*['\"]?([^'\"[:space:]]+)['\"]?.*/\1/p" "$APP_DIR/pubspec.yaml" | head -n 1)"
+              RAW_VERSION="${PUBSPEC_VERSION%%+*}"
+            fi
+
+            RAW_VERSION="${RAW_VERSION#v}"
+
+            if [ -z "$RAW_VERSION" ]; then
+              echo "::error::Could not resolve version. Set workflow input 'version' or check $APP_DIR/pubspec.yaml."
+              exit 1
+            fi
+
+            TAG="v$RAW_VERSION"
+
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+              TAG_TARGET="$(git rev-list -n 1 "$TAG")"
+              HEAD_SHA="$(git rev-parse HEAD)"
+
+              if [ "$TAG_TARGET" != "$HEAD_SHA" ]; then
+                echo "::error::Tag $TAG already exists on another commit."
+                echo "Tag target: $TAG_TARGET"
+                echo "Current HEAD: $HEAD_SHA"
+                exit 1
+              fi
+
+              SHOULD_CREATE_TAG="false"
+            else
+              SHOULD_CREATE_TAG="true"
+            fi
+          fi
+
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            echo "::error::Invalid git tag: $TAG"
+            exit 1
+          fi
+
+          PRERELEASE="false"
+
+          if [[ "$TAG" =~ (alpha|beta|rc) ]]; then
+            PRERELEASE="true"
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_PRERELEASE" = "true" ]; then
+            PRERELEASE="true"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          echo "Release tag: $TAG"
+          echo "Create tag: $SHOULD_CREATE_TAG"
+          echo "Prerelease: $PRERELEASE"
+
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+
+          XCODE_APP="$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' -print | sort | tail -n 1)"
+
+          if [ -z "$XCODE_APP" ] && [ -d "/Applications/Xcode.app" ]; then
+            XCODE_APP="/Applications/Xcode.app"
+          fi
+
+          if [ -z "$XCODE_APP" ]; then
+            echo "::error::Xcode 26 is required for connectivity_plus 7.1.x."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+          XCODE_VERSION_OUTPUT="$(xcodebuild -version)"
+          MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+
+          echo "$XCODE_VERSION_OUTPUT"
+          echo "macOS SDK $MACOS_SDK_VERSION"
+
+          XCODE_FIRST_LINE="${XCODE_VERSION_OUTPUT%%$'\n'*}"
+
+          if [[ ! "$XCODE_FIRST_LINE" =~ ^Xcode[[:space:]]26\. ]]; then
+            echo "::error::Selected Xcode is not Xcode 26: $XCODE_FIRST_LINE"
+            exit 1
+          fi
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          architecture: arm64
+          cache: true
+
+      - name: Show tool versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          swift --version
+          flutter --version
+          dart --version
+          pod --version || true
+          hdiutil help | head -n 1 || true
+
+      - name: Enable Flutter macOS Desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Restore Flutter packages
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Build macOS app
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          flutter build macos --release
+
+      - name: Create DMG
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          DIST_DIR="build/dist/macos"
+          RELEASE_DIR="build/macos/Build/Products/Release"
+          STAGE_DIR="$(mktemp -d)"
+
+          rm -rf "$DIST_DIR"
+          mkdir -p "$DIST_DIR"
+
+          APP_PATH="$(find "$RELEASE_DIR" -maxdepth 1 -type d -name '*.app' -print | head -n 1)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle was produced under $RELEASE_DIR."
+            find build/macos -maxdepth 5 -type d -name '*.app' -print || true
+            exit 1
+          fi
+
+          APP_BUNDLE="$(basename "$APP_PATH")"
+          APP_NAME="${APP_BUNDLE%.app}"
+          SAFE_APP_NAME="$(echo "$APP_NAME" | tr ' /' '__' | tr -cd '[:alnum:]._+-')"
+          DMG_PATH="$DIST_DIR/${SAFE_APP_NAME}-${RELEASE_TAG}-macos.dmg"
+
+          ditto "$APP_PATH" "$STAGE_DIR/$APP_BUNDLE"
+          ln -s /Applications "$STAGE_DIR/Applications"
+
+          hdiutil create \
+            -volname "$APP_NAME" \
+            -srcfolder "$STAGE_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_PATH"
+
+          rm -rf "$STAGE_DIR"
+
+          echo "Created DMG:"
+          ls -lh "$DMG_PATH"
+
+      - name: Check DMG output
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+
+          ARTIFACTS="$(find build/dist -type f -name '*.dmg' -print)"
+
+          if [ -z "$ARTIFACTS" ]; then
+            echo "::error::No dmg files were produced under build/dist."
+            find build -maxdepth 5 -type f | sort || true
+            exit 1
+          fi
+
+          echo "$ARTIFACTS"
+          find build/dist -type f -name '*.dmg' -exec du -h {} \;
+
+      - name: Create release tag
+        if: steps.meta.outputs.should_create_tag == 'true'
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.meta.outputs.tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: simple_live_app/build/dist/**/*.dmg
+
+      - name: Finalize
+        if: always()
+        run: echo "macOS DMG release finished with status ${{ job.status }}."
